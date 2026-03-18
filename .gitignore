@@ -1,0 +1,5 @@
+.env
+*.xlsx
+*.html
+__pycache__/
+*.pyc
