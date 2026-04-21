@@ -13,7 +13,7 @@ SEC  = os.getenv("FALCON_CLIENT_SECRET") or os.getenv("CS_CLIENT_SECRET")
 BASE = os.getenv("FALCON_BASE_URL") or os.getenv("CS_BASE_URL") or "https://api.crowdstrike.com"
 MCID = os.getenv("FALCON_MEMBER_CID")
 CLIENT_NAME = os.getenv("CS_CLIENT_NAME", "")          # Nombre del cliente (opcional)
-LIMIT    = int(os.getenv("CS_PAGE_LIMIT", "500"))
+LIMIT    = int(os.getenv("CS_PAGE_LIMIT", "5000"))
 OUT_XLSX = os.getenv("CS_OUT_XLSX", "health_check.xlsx")
 OUT_HTML = os.getenv("CS_OUT_HTML", "health_check.html")
 
@@ -72,11 +72,27 @@ def get_policies_via_ids(api, query_op, get_op, flt):
     return out
 
 def fetch_all_aids(hosts, flt=None):
-    r = hosts.query_devices_by_filter_scroll(filter=flt, limit=LIMIT) if flt \
-        else hosts.query_devices_by_filter_scroll(limit=LIMIT)
-    if r.get("status_code") != 200:
-        raise APIError(code=r.get("status_code"), message=str(r))
-    return r.get("body", {}).get("resources", []) or []
+    aids, after = [], None
+    while True:
+        kw = {"limit": LIMIT}
+        if flt:
+            kw["filter"] = flt
+        if after:
+            kw["after"] = after
+        r = hosts.query_devices_by_filter_scroll(**kw)
+        if r.get("status_code") != 200:
+            raise APIError(code=r.get("status_code"), message=str(r))
+        body = r.get("body", {})
+        pagination = body.get("meta", {}).get("pagination", {})
+        total = pagination.get("total", 0)
+        page = body.get("resources", []) or []
+        aids.extend(page)
+        after = pagination.get("after") or ""
+        logging.info("fetch_all_aids: page=%d fetched=%d total_api=%d has_after=%s",
+                     len(page), len(aids), total, bool(after))
+        if not page or not after or (total and len(aids) >= total):
+            break
+    return aids
 
 def fetch_host_details(hosts, aids):
     rows = []
@@ -570,6 +586,573 @@ def fetch_ngsiem_metrics(cid, sec, base, mcid=None):
 
 
 # ---------------------------
+# Health Score & Recommendations
+# ---------------------------
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+SEVERITY_COLORS = {"critical":"#7d1128","high":"#dc3545","medium":"#fd7e14","low":"#ffc107","info":"#0dcaf0"}
+SEVERITY_BG = {"critical":"rgba(125,17,40,.1)","high":"rgba(220,53,69,.08)","medium":"rgba(253,126,20,.08)","low":"rgba(255,193,7,.06)","info":"rgba(13,202,240,.06)"}
+
+def compute_health_score(df_hosts, df_prev, df_dets, df_sensor_age_counts, ngsiem):
+    """Calcula un score 0-100 basado en múltiples factores."""
+    scores = {}  # category -> (score 0-100, weight)
+    total_sensors = len(df_hosts) if not df_hosts.empty else 0
+
+    # 1. Sensor freshness (25 pts) — % sensores en N o N-1
+    if not df_sensor_age_counts.empty and total_sensors > 0:
+        combined = df_sensor_age_counts[df_sensor_age_counts["platform"]=="Combined"]
+        if not combined.empty:
+            r = combined.iloc[0]
+            fresh = int(r.get("N",0)) + int(r.get("N-1",0))
+            pct_fresh = fresh / total_sensors * 100 if total_sensors else 0
+            scores["sensor_freshness"] = (min(pct_fresh, 100), 25)
+        else:
+            scores["sensor_freshness"] = (50, 25)
+    else:
+        scores["sensor_freshness"] = (0, 25)
+
+    # 2. Sensor activity (15 pts) — % sensores activos (no inactive 14d)
+    if not df_hosts.empty and "is_inactive_14d" in df_hosts:
+        active_pct = (1 - df_hosts["is_inactive_14d"].mean()) * 100
+        scores["sensor_activity"] = (active_pct, 15)
+    else:
+        scores["sensor_activity"] = (100, 15)
+
+    # 3. RFM (10 pts) — % sensores sin RFM
+    if not df_hosts.empty:
+        rfm = df_hosts["rfm_state"].apply(lambda x: str(x).lower() in ("true","yes","1") if pd.notna(x) else False)
+        rfm_pct = (1 - rfm.mean()) * 100
+        scores["rfm"] = (rfm_pct, 10)
+    else:
+        scores["rfm"] = (100, 10)
+
+    # 4. Policy compliance (25 pts) — % prevention settings ON
+    if not df_prev.empty and "value_norm" in df_prev:
+        on_count = (df_prev["value_norm"].str.upper() == "ON").sum()
+        total = len(df_prev[df_prev["value_norm"].notna()])
+        pct = on_count / total * 100 if total else 0
+        scores["policy_compliance"] = (pct, 25)
+    else:
+        scores["policy_compliance"] = (0, 25)
+
+    # 5. Detection resolution (15 pts) — % detecciones cerradas
+    if not df_dets.empty and "status" in df_dets:
+        closed = df_dets["status"].str.lower().isin(["closed","resolved","true_positive","false_positive"])
+        pct_closed = closed.mean() * 100
+        scores["detection_resolution"] = (pct_closed, 15)
+    else:
+        scores["detection_resolution"] = (100, 15)
+
+    # 6. NG SIEM usage (10 pts)
+    ng = ngsiem or {}
+    if ng.get("available"):
+        ng_score = 50  # baseline for having it
+        if ng.get("manual_connectors") or ng.get("connectors"):
+            active_conns = sum(1 for c in (ng.get("manual_connectors") or []) if c.get("status","").lower() == "active")
+            total_conns = len(ng.get("manual_connectors") or ng.get("connectors") or [])
+            if total_conns:
+                ng_score = 50 + (active_conns / total_conns * 50)
+        scores["ngsiem"] = (ng_score, 10)
+    else:
+        scores["ngsiem"] = (0, 10)
+
+    # Weighted average
+    total_weight = sum(w for _, w in scores.values())
+    weighted = sum(s * w for s, w in scores.values())
+    overall = round(weighted / total_weight) if total_weight else 0
+
+    return {
+        "overall": overall,
+        "breakdown": {k: round(v[0], 1) for k, v in scores.items()},
+        "weights": {k: v[1] for k, v in scores.items()},
+    }
+
+
+def generate_recommendations(df_hosts, df_prev, df_dets, df_sensor_age_counts, ngsiem):
+    """Genera recomendaciones priorizadas basadas en los datos recopilados."""
+    recs = []
+    total_sensors = len(df_hosts) if not df_hosts.empty else 0
+
+    # --- Sensor Freshness ---
+    if not df_sensor_age_counts.empty and total_sensors > 0:
+        combined = df_sensor_age_counts[df_sensor_age_counts["platform"]=="Combined"]
+        if not combined.empty:
+            r = combined.iloc[0]
+            old = int(r.get("N-3_plus",0))
+            pct_old = old / total_sensors * 100 if total_sensors else 0
+            if pct_old > 20:
+                recs.append({"severity":"high","category":"Sensor Health","title":f"{old} sensores ({pct_old:.0f}%) en versiones N-3 o anteriores",
+                    "detail":f"Hay {old} dispositivos con versiones de sensor muy desactualizadas. Esto implica falta de protección contra amenazas nuevas y posibles vulnerabilidades en el agente.",
+                    "mitigation":"Revisar las Sensor Update Policies. Verificar que las políticas tengan habilitada la actualización automática. Para hosts offline, planificar actualización manual o via herramienta de deployment."})
+            elif pct_old > 5:
+                recs.append({"severity":"medium","category":"Sensor Health","title":f"{old} sensores ({pct_old:.0f}%) en versiones N-3 o anteriores",
+                    "detail":"Un grupo de dispositivos tiene sensores desactualizados.",
+                    "mitigation":"Verificar que las Sensor Update Policies estén configuradas con actualización automática y que los hosts tengan conectividad al cloud de CrowdStrike."})
+
+    # --- Inactive sensors ---
+    if not df_hosts.empty and "is_inactive_14d" in df_hosts:
+        inactive = int(df_hosts["is_inactive_14d"].sum())
+        pct_inactive = inactive / total_sensors * 100 if total_sensors else 0
+        if pct_inactive > 15:
+            recs.append({"severity":"high","category":"Sensor Health","title":f"{inactive} sensores ({pct_inactive:.0f}%) inactivos hace más de 14 días",
+                "detail":"Estos hosts no reportan al cloud de CrowdStrike. Pueden estar apagados, desinstalados, o sin conexión.",
+                "mitigation":"Identificar los hosts inactivos en la sección de Hosts. Cruzar con el inventario de IT para determinar si son hosts dados de baja. Para hosts válidos, verificar conectividad de red al cloud de CrowdStrike (*.crowdstrike.com)."})
+        elif inactive > 0:
+            recs.append({"severity":"medium","category":"Sensor Health","title":f"{inactive} sensores inactivos (>14 días sin reportar)",
+                "detail":"Algunos hosts no reportan al cloud. Revisar si son hosts legítimos.",
+                "mitigation":"Revisar el listado de hosts inactivos y determinar si corresponde dar de baja o reconectar los sensores."})
+
+    # --- RFM ---
+    if not df_hosts.empty:
+        rfm = df_hosts["rfm_state"].apply(lambda x: str(x).lower() in ("true","yes","1") if pd.notna(x) else False)
+        rfm_count = int(rfm.sum())
+        if rfm_count > 0:
+            recs.append({"severity":"critical","category":"Sensor Health","title":f"{rfm_count} sensores en Reduced Functionality Mode (RFM)",
+                "detail":"Los sensores en RFM tienen capacidades limitadas de detección y prevención. Esto puede deberse a licencia vencida, incompatibilidad de kernel, o problemas de espacio en disco.",
+                "mitigation":"Para cada host en RFM: verificar espacio en disco (mínimo 500MB libres), verificar compatibilidad del kernel con la versión de agente, y contactar soporte de CrowdStrike si persiste."})
+
+    # --- Policy Compliance ---
+    if not df_prev.empty and "value_norm" in df_prev:
+        for plat in ["Windows","Mac","Linux"]:
+            dp = df_prev[df_prev["platform_name"].str.upper()==plat.upper()]
+            if dp.empty:
+                continue
+            off_settings = dp[dp["value_norm"].str.upper()=="OFF"]
+            if not off_settings.empty:
+                n_off = len(off_settings)
+                n_total = len(dp[dp["value_norm"].notna()])
+                pct_off = n_off / n_total * 100 if n_total else 0
+                # Get unique setting names that are OFF
+                off_names = off_settings["setting_name"].unique()[:5]
+                sev = "high" if pct_off > 40 else "medium" if pct_off > 20 else "low"
+                recs.append({"severity":sev,"category":f"Políticas ({plat})",
+                    "title":f"{n_off} settings de prevención deshabilitados ({pct_off:.0f}%)",
+                    "detail":f"Settings OFF incluyen: {', '.join(str(s) for s in off_names)}{'...' if len(off_names)>=5 else ''}",
+                    "mitigation":f"Revisar la configuración de Prevention Policies para {plat}. Habilitar detección y prevención para: Machine Learning, Ransomware, Exploit Mitigation, Script-Based Execution Monitoring. Evaluar el impacto antes de cambiar a prevención en producción."})
+
+        # Check if any policy is fully disabled
+        if "policy_enabled" in df_prev:
+            disabled_pols = df_prev[df_prev["policy_enabled"]==False]["policy_name"].unique()
+            if len(disabled_pols) > 0:
+                recs.append({"severity":"critical","category":"Políticas",
+                    "title":f"{len(disabled_pols)} política(s) de prevención deshabilitada(s)",
+                    "detail":f"Políticas deshabilitadas: {', '.join(str(p) for p in disabled_pols[:5])}. Los hosts asignados a estas políticas NO tienen protección de prevención activa.",
+                    "mitigation":"Habilitar las políticas de prevención deshabilitadas o reasignar los hosts a políticas activas."})
+
+    # --- Detections ---
+    if not df_dets.empty and "status" in df_dets:
+        total_dets = df_dets["detection_id"].nunique()
+        new_dets = df_dets[df_dets["status"].str.lower()=="new"]["detection_id"].nunique()
+        crit_new = df_dets[(df_dets["status"].str.lower()=="new") & (df_dets["severity"].str.upper().isin(["CRITICAL","HIGH"]))]["detection_id"].nunique()
+
+        if crit_new > 0:
+            recs.append({"severity":"critical","category":"Detecciones",
+                "title":f"{crit_new} detecciones Critical/High sin resolver",
+                "detail":"Hay alertas de alta severidad que no han sido triageadas. Estas podrían indicar compromiso activo.",
+                "mitigation":"Revisar inmediatamente las detecciones Critical y High en el dashboard de CrowdStrike. Realizar triage, investigar IoCs, y tomar acciones de contención si corresponde."})
+
+        if new_dets > 0 and total_dets > 0:
+            pct_new = new_dets / total_dets * 100
+            if pct_new > 50:
+                recs.append({"severity":"high","category":"Detecciones",
+                    "title":f"{pct_new:.0f}% de detecciones sin triage ({new_dets}/{total_dets})",
+                    "detail":"La mayoría de las detecciones están en estado 'new'. Esto indica falta de proceso de respuesta a incidentes o falta de atención a las alertas.",
+                    "mitigation":"Implementar un proceso de triage de alertas. Asignar responsables para revisión diaria. Considerar activar Falcon Complete para respuesta gestionada."})
+
+        # MTTR
+        if "created_timestamp" in df_dets:
+            closed_dets = df_dets[df_dets["status"].str.lower().isin(["closed","resolved","true_positive","false_positive"])]
+            # We can't calculate MTTR without close timestamps, but we can flag if many are open
+            open_dets = total_dets - len(closed_dets["detection_id"].unique())
+            if open_dets > 0 and total_dets > 10:
+                recs.append({"severity":"medium","category":"Detecciones",
+                    "title":f"{open_dets} detecciones abiertas de {total_dets} totales",
+                    "detail":"Las detecciones abiertas acumuladas dificultan el triage de nuevas alertas y pueden enmascarar amenazas reales.",
+                    "mitigation":"Realizar una revisión bulk de detecciones abiertas. Cerrar falsos positivos con justificación. Crear exclusiones para detecciones recurrentes legítimas."})
+
+    # --- NG SIEM ---
+    ng = ngsiem or {}
+    if not ng.get("available"):
+        recs.append({"severity":"medium","category":"NG SIEM",
+            "title":"NG SIEM no configurado o no accesible",
+            "detail":"No se pudo acceder a la funcionalidad de NG SIEM. Sin SIEM, no hay correlación de eventos ni visibilidad centralizada de logs.",
+            "mitigation":"Verificar que el tenant tenga licencia de NG SIEM (incluida en Falcon Insight XDR). Configurar Data Connectors para ingestar logs de terceros (firewall, identity, email, etc.)."})
+    else:
+        manual_conns = ng.get("manual_connectors", [])
+        error_conns = [c for c in manual_conns if c.get("status","").lower() in ("error","disconnected")]
+        if error_conns:
+            names = ", ".join(c["name"] for c in error_conns)
+            recs.append({"severity":"high","category":"NG SIEM",
+                "title":f"{len(error_conns)} conector(es) con error",
+                "detail":f"Conectores con problemas: {names}. Estos conectores no están ingiriendo datos.",
+                "mitigation":"Revisar la configuración de cada conector en Data Connectors. Verificar credenciales, endpoints, y permisos del conector."})
+        idle_conns = [c for c in manual_conns if c.get("status","").lower() in ("idle","pending")]
+        if idle_conns:
+            names = ", ".join(c["name"] for c in idle_conns)
+            recs.append({"severity":"low","category":"NG SIEM",
+                "title":f"{len(idle_conns)} conector(es) idle/pending",
+                "detail":f"Conectores sin actividad: {names}. Pueden no estar configurados correctamente.",
+                "mitigation":"Verificar la configuración y activar los conectores pendientes."})
+        # Ingest limit
+        if ng.get("limit_gb") and ng.get("avg_gb_day"):
+            pct = ng["avg_gb_day"] / ng["limit_gb"] * 100
+            if pct < 10:
+                recs.append({"severity":"info","category":"NG SIEM",
+                    "title":f"Ingesta promedio muy baja ({pct:.0f}% del límite)",
+                    "detail":f"Se están ingiriendo {ng['avg_gb_day']} GB/día de un límite de {ng['limit_gb']} GB/día.",
+                    "mitigation":"Considerar agregar más fuentes de datos: logs de firewall, proxy, VPN, WAF, identity provider, cloud trail, email gateway."})
+
+    recs.sort(key=lambda r: SEVERITY_ORDER.get(r.get("severity","info"), 99))
+    return recs
+
+
+def _recommendations_html(recs):
+    """Genera HTML de la sección de recomendaciones."""
+    if not recs:
+        return '<div class="card"><div class="card-body text-center py-4"><span style="font-size:2rem">&#x2705;</span><div class="mt-2 text-muted">Sin hallazgos. La configuración cumple con las buenas prácticas.</div></div></div>'
+    by_sev = {}
+    for r in recs:
+        s = r.get("severity","info")
+        by_sev[s] = by_sev.get(s,0)+1
+    sev_badges = ""
+    for sev in ["critical","high","medium","low","info"]:
+        if sev in by_sev:
+            sev_badges += f'<span class="badge fs-6 me-2" style="background:{SEVERITY_COLORS[sev]}">{sev.upper()}: {by_sev[sev]}</span>'
+    by_cat = {}
+    for r in recs:
+        c = r.get("category","Otro")
+        by_cat[c] = by_cat.get(c,0)+1
+    rows_html = ""
+    for cat in sorted(by_cat.keys()):
+        cat_recs = [r for r in recs if r.get("category")==cat]
+        rows_html += f'<tr class="table-dark"><td colspan="4" style="font-size:.88rem;font-weight:700">{cat} ({len(cat_recs)})</td></tr>'
+        for r in cat_recs:
+            sev = r.get("severity","info")
+            rows_html += (
+                f'<tr style="background:{SEVERITY_BG.get(sev,"")}">'
+                f'<td><span class="badge" style="background:{SEVERITY_COLORS.get(sev,"#6c757d")}">{sev.upper()}</span></td>'
+                f'<td><strong>{r.get("title","")}</strong><br><small class="text-muted">{r.get("detail","")}</small></td>'
+                f'<td style="font-size:.78rem"><strong>{r.get("mitigation","")}</strong></td></tr>')
+    return f"""
+    <div class="d-flex gap-2 flex-wrap mb-3 align-items-center">
+      <span style="font-weight:700;font-size:.9rem">{len(recs)} hallazgos:</span> {sev_badges}
+    </div>
+    <div class="card"><div class="card-body p-0"><div class="table-responsive">
+      <table class="table table-sm mb-0" style="font-size:.82rem">
+        <thead class="table-dark sticky-top"><tr>
+          <th style="width:80px">Severidad</th><th style="width:40%">Hallazgo / Detalle</th>
+          <th>Mitigación</th></tr></thead>
+        <tbody>{rows_html}</tbody></table>
+    </div></div></div>"""
+
+
+# ---------------------------
+# Policy Settings Knowledge Base  (riesgo vs fricción)
+# ---------------------------
+# Cada entry: setting_id_pattern -> (desc, risk_if_off, friction_if_on, risk_level, friction_level)
+# risk_level / friction_level: "critical","high","medium","low"
+# El matching es case-insensitive substring sobre setting_name o setting_id.
+POLICY_KB = [
+    # --- NGAV / ML ---
+    {"match": ["cloud anti-malware","cloudantimalware","cloud_anti_malware","cloud ml"],
+     "name": "Cloud Anti-Malware (ML)",
+     "desc": "Usa modelos de Machine Learning en la nube para detectar malware desconocido en tiempo real.",
+     "risk_off": "Sin ML cloud, el sensor depende solo de firmas locales y pierde capacidad de detectar malware zero-day y variantes nuevas.",
+     "friction_on": "Bajo. Puede generar falsos positivos en software custom o compiladores internos. Se recomienda empezar en DETECT y pasar a PREVENT.",
+     "risk_level": "critical", "friction_level": "low"},
+
+    {"match": ["sensor anti-malware","sensorantimalware","sensor_anti_malware","sensor ml","on-sensor ml"],
+     "name": "Sensor Anti-Malware (ML local)",
+     "desc": "Modelo de ML que corre localmente en el sensor para detección offline (sin conexión al cloud).",
+     "risk_off": "Si el host pierde conectividad al cloud, no tendrá detección ML. Solo quedará protección por firmas.",
+     "friction_on": "Bajo. Consume algo más de CPU/RAM en el endpoint. Mismo riesgo de FP que cloud ML.",
+     "risk_level": "high", "friction_level": "low"},
+
+    {"match": ["quarantine","cuarentena"],
+     "name": "Quarantine (Cuarentena)",
+     "desc": "Mueve automáticamente archivos maliciosos detectados a cuarentena, impidiendo su ejecución.",
+     "risk_off": "Los archivos maliciosos detectados NO se bloquean — solo se genera la alerta. El usuario puede ejecutar malware conocido.",
+     "friction_on": "Medio. Puede poner en cuarentena herramientas legítimas que disparan ML. Requiere un proceso de excepciones.",
+     "risk_level": "critical", "friction_level": "medium"},
+
+    # --- Script & Execution ---
+    {"match": ["script-based execution","script based","scriptbased","script_based"],
+     "name": "Script-Based Execution Monitoring",
+     "desc": "Monitorea y puede bloquear ejecución de scripts (PowerShell, VBScript, JScript, macros).",
+     "risk_off": "Los atacantes usan scripts como vector principal (fileless malware, PowerShell Empire, etc.). Sin esto, no hay visibilidad.",
+     "friction_on": "Medio-Alto. Puede afectar scripts de administración, GPOs, herramientas de deployment. Requiere tuning de exclusiones.",
+     "risk_level": "critical", "friction_level": "high"},
+
+    {"match": ["intelligence-sourced","intelligence sourced","ioa","custom intelligence"],
+     "name": "Intelligence-Sourced Threats (IoA)",
+     "desc": "Detecta amenazas basadas en Indicators of Attack de la inteligencia de CrowdStrike.",
+     "risk_off": "Se pierden detecciones de amenazas activas identificadas por el equipo de threat intelligence de CrowdStrike.",
+     "friction_on": "Bajo. Son reglas curadas por CrowdStrike con muy baja tasa de falsos positivos.",
+     "risk_level": "critical", "friction_level": "low"},
+
+    # --- Exploit & Injection ---
+    {"match": ["exploit mitigation","additional user mode","user mode data","aum"],
+     "name": "Exploit Mitigation / User Mode Data",
+     "desc": "Detecta y previene técnicas de explotación de vulnerabilidades en memoria (heap spray, ROP, stack pivot).",
+     "risk_off": "Los exploits de día cero contra aplicaciones (browser, Office, Adobe) no serán detectados por behavioral analysis.",
+     "friction_on": "Bajo-Medio. Raramente genera falsos positivos. Puede afectar software de debugging o herramientas de seguridad ofensiva.",
+     "risk_level": "critical", "friction_level": "low"},
+
+    {"match": ["code injection","process injection","injection"],
+     "name": "Code/Process Injection Detection",
+     "desc": "Detecta inyección de código en procesos legítimos (DLL injection, process hollowing, etc.).",
+     "risk_off": "Técnica clave de evasión — los atacantes inyectan código en procesos confiables para evadir EDR.",
+     "friction_on": "Medio. Algunas herramientas legítimas de accessibility, AV legacy, o DRM usan inyección. Requiere excepciones puntuales.",
+     "risk_level": "high", "friction_level": "medium"},
+
+    # --- Ransomware ---
+    {"match": ["ransomware","ransom"],
+     "name": "Ransomware Protection",
+     "desc": "Detecta comportamiento de cifrado masivo de archivos y lo bloquea antes de completar.",
+     "risk_off": "Sin protección de ransomware, un ataque exitoso puede cifrar todos los archivos del host y compartidos de red.",
+     "friction_on": "Bajo. Muy pocas aplicaciones legítimas cifran archivos masivamente. Software de backup/encryption puede requerir excepción.",
+     "risk_level": "critical", "friction_level": "low"},
+
+    # --- Lateral Movement ---
+    {"match": ["lateral movement","lateral"],
+     "name": "Lateral Movement Detection",
+     "desc": "Detecta técnicas de movimiento lateral: pass-the-hash, PsExec, WMI remoto, RDP brute force.",
+     "risk_off": "Un atacante que compromete un host puede moverse libremente a otros sistemas sin ser detectado.",
+     "friction_on": "Medio. Herramientas de administración remota (SCCM, Ansible, RMM) pueden generar alertas. Requiere baseline de comportamiento normal.",
+     "risk_level": "high", "friction_level": "medium"},
+
+    # --- Credential Theft ---
+    {"match": ["credential","credguard","credential dumping","lsass"],
+     "name": "Credential Theft Detection",
+     "desc": "Detecta intentos de robo de credenciales: volcado de LSASS, mimikatz, kerberoasting.",
+     "risk_off": "Los atacantes pueden extraer credenciales y escalar privilegios sin ser detectados.",
+     "friction_on": "Bajo-Medio. Algunos productos de SSO o herramientas de IT que interactúan con LSASS pueden generar alertas.",
+     "risk_level": "critical", "friction_level": "low"},
+
+    # --- USB / Device Control ---
+    {"match": ["usb","removable media","device control","usb device"],
+     "name": "USB / Removable Media Control",
+     "desc": "Controla qué dispositivos USB pueden conectarse y qué operaciones pueden realizar.",
+     "risk_off": "Los usuarios pueden conectar USB con malware, o exfiltrar datos a dispositivos removibles.",
+     "friction_on": "Alto. Puede bloquear periféricos legítimos (mouse, teclado, impresoras USB). Requiere política granular por tipo de dispositivo.",
+     "risk_level": "medium", "friction_level": "high"},
+
+    # --- Network & Firewall ---
+    {"match": ["firewall","network contain","network isolation"],
+     "name": "Host Firewall Management",
+     "desc": "Gestiona reglas de firewall del host desde CrowdStrike.",
+     "risk_off": "Sin firewall gestionado, no hay control centralizado del tráfico de red del endpoint.",
+     "friction_on": "Alto. Reglas mal configuradas pueden bloquear tráfico legítimo y causar caída de servicios. Requiere planificación cuidadosa.",
+     "risk_level": "medium", "friction_level": "high"},
+
+    # --- Visibility ---
+    {"match": ["visibility","enhanced visibility","telemetry"],
+     "name": "Enhanced Visibility / Telemetry",
+     "desc": "Incrementa la telemetría enviada al cloud para mejor detección y threat hunting.",
+     "risk_off": "Menor visibilidad para threat hunting y respuesta a incidentes. Las investigaciones serán más limitadas.",
+     "friction_on": "Bajo. Incrementa levemente el consumo de ancho de banda y almacenamiento en el cloud.",
+     "risk_level": "medium", "friction_level": "low"},
+
+    # --- On Write ---
+    {"match": ["on write","on-write","onwrite","prevent suspicious"],
+     "name": "On-Write Detection",
+     "desc": "Analiza archivos al momento de escribirse en disco, antes de su ejecución.",
+     "risk_off": "El malware puede residir en disco sin ser detectado hasta que el usuario lo ejecute.",
+     "friction_on": "Bajo. Puede agregar un mínimo de latencia en operaciones de escritura de archivos.",
+     "risk_level": "high", "friction_level": "low"},
+
+    # --- Process Blocking ---
+    {"match": ["process blocking","suspicious process","block","hash blocking"],
+     "name": "Suspicious Process Blocking",
+     "desc": "Bloquea la ejecución de procesos catalogados como sospechosos o maliciosos.",
+     "risk_off": "Los procesos maliciosos detectados se alertan pero NO se bloquean — el malware continúa ejecutándose.",
+     "friction_on": "Medio. En modo prevención puede bloquear herramientas de pentest, scripts internos, o software no firmado.",
+     "risk_level": "critical", "friction_level": "medium"},
+
+    # --- Sensor Tampering ---
+    {"match": ["sensor tamper","tamper protection","uninstall","anti-tamper"],
+     "name": "Sensor Tamper Protection",
+     "desc": "Previene que el sensor sea desinstalado o deshabilitado sin autorización.",
+     "risk_off": "Un atacante con acceso admin puede desinstalar el sensor y operar sin ninguna detección.",
+     "friction_on": "Bajo. Solo afecta si IT necesita desinstalar el sensor — requiere token de mantenimiento.",
+     "risk_level": "critical", "friction_level": "low"},
+
+    # --- Interpreter-Only ---
+    {"match": ["interpreter only","interpreter-only","fileless"],
+     "name": "Interpreter-Only (Fileless) Detection",
+     "desc": "Detecta malware fileless que vive solo en memoria sin tocar disco.",
+     "risk_off": "Los ataques fileless (living-off-the-land) son el método más común de evasión actual y no serán detectados.",
+     "friction_on": "Medio. Puede generar alertas en scripts de automatización legítimos.",
+     "risk_level": "high", "friction_level": "medium"},
+
+    # --- Adware/PUP ---
+    {"match": ["adware","pup","potentially unwanted"],
+     "name": "Adware / PUP Detection",
+     "desc": "Detecta programas potencialmente no deseados (adware, toolbars, bundleware).",
+     "risk_off": "Los PUPs pueden degradar rendimiento, exfiltrar datos, o servir como vector de entrada.",
+     "friction_on": "Medio. Puede marcar software legítimo gratuito que incluye bundleware.",
+     "risk_level": "low", "friction_level": "medium"},
+
+    # --- Chopper Webshell ---
+    {"match": ["chopper","webshell","web shell"],
+     "name": "Chopper Webshell Detection",
+     "desc": "Detecta webshells conocidos usados para persistencia en servidores web.",
+     "risk_off": "Los atacantes pueden mantener acceso persistente a servidores web sin detección.",
+     "friction_on": "Bajo. Solo aplica a servidores web. Falsos positivos muy raros.",
+     "risk_level": "high", "friction_level": "low"},
+
+    # --- Drift Detection (Linux) ---
+    {"match": ["drift","container drift","image drift"],
+     "name": "Container Drift Detection",
+     "desc": "Detecta cambios no autorizados en contenedores respecto a su imagen base.",
+     "risk_off": "Un atacante puede modificar un contenedor en runtime sin ser detectado.",
+     "friction_on": "Medio. Puede alertar sobre actualizaciones legítimas de contenedores o procesos de CI/CD.",
+     "risk_level": "medium", "friction_level": "medium"},
+
+    # --- MalQuery / YARA ---
+    {"match": ["custom blocking","ioc","custom ioc","ioc management"],
+     "name": "Custom IOC Blocking",
+     "desc": "Permite bloquear hashes, IPs, dominios custom definidos por el equipo de seguridad.",
+     "risk_off": "No se pueden bloquear IoCs específicos identificados en investigaciones internas.",
+     "friction_on": "Bajo. Solo bloquea lo que el equipo agrega manualmente. Requiere gestión activa de la lista de IoCs.",
+     "risk_level": "medium", "friction_level": "low"},
+]
+
+def _match_setting_to_kb(setting_name: str, setting_id: str = "") -> dict | None:
+    """Busca en el KB el setting que mejor matchea por nombre o ID."""
+    sn = (setting_name or "").lower()
+    si = (setting_id or "").lower()
+    for entry in POLICY_KB:
+        for pattern in entry["match"]:
+            if pattern in sn or pattern in si:
+                return entry
+    return None
+
+def _build_risk_matrix_html(df_prev: pd.DataFrame) -> str:
+    """Genera la tabla HTML de riesgo vs fricción cruzando con el estado actual de las políticas."""
+    if df_prev.empty or "value_norm" not in df_prev:
+        return '<p class="text-muted">Sin datos de políticas de prevención.</p>'
+
+    # Get unique settings across all platforms/policies
+    settings_seen = {}  # setting_name -> {kb_entry, platforms: {plat: {pol: value}}}
+    for _, row in df_prev.iterrows():
+        sname = str(row.get("setting_name",""))
+        sid   = str(row.get("setting_id",""))
+        if not sname:
+            continue
+        kb = _match_setting_to_kb(sname, sid)
+        if sname not in settings_seen:
+            settings_seen[sname] = {"kb": kb, "sid": sid, "platforms": {}}
+        plat = str(row.get("platform_name",""))
+        pol  = str(row.get("policy_name",""))
+        val  = str(row.get("value_norm",""))
+        if plat not in settings_seen[sname]["platforms"]:
+            settings_seen[sname]["platforms"][plat] = {}
+        settings_seen[sname]["platforms"][plat][pol] = val
+
+    # Build rows — only settings with KB entries, sorted by risk level
+    risk_order = {"critical":0,"high":1,"medium":2,"low":3}
+    rows = []
+    for sname, info in settings_seen.items():
+        kb = info["kb"]
+        if not kb:
+            continue
+        # Determine current state across all policies
+        all_vals = []
+        for plat_pols in info["platforms"].values():
+            all_vals.extend(plat_pols.values())
+        on_count  = sum(1 for v in all_vals if v.upper()=="ON")
+        off_count = sum(1 for v in all_vals if v.upper()=="OFF")
+        total = on_count + off_count
+        # Status summary
+        if total == 0:
+            status_html = '<span class="text-muted">—</span>'
+        elif off_count == 0:
+            status_html = '<span class="badge bg-success">100% ON</span>'
+        elif on_count == 0:
+            status_html = '<span class="badge bg-danger">100% OFF</span>'
+        else:
+            pct = round(on_count/total*100)
+            status_html = f'<span class="badge bg-warning text-dark">{pct}% ON</span>'
+        # Per-platform mini status
+        plat_badges = ""
+        for plat in ["Windows","Mac","Linux"]:
+            pols = info["platforms"].get(plat, {})
+            if not pols:
+                continue
+            p_on  = sum(1 for v in pols.values() if v.upper()=="ON")
+            p_off = sum(1 for v in pols.values() if v.upper()=="OFF")
+            p_t   = p_on + p_off
+            if p_t == 0: continue
+            if p_off == 0:
+                plat_badges += f'<span class="badge bg-success me-1" style="font-size:.65rem">{plat[:3]}: ON</span>'
+            elif p_on == 0:
+                plat_badges += f'<span class="badge bg-danger me-1" style="font-size:.65rem">{plat[:3]}: OFF</span>'
+            else:
+                plat_badges += f'<span class="badge bg-warning text-dark me-1" style="font-size:.65rem">{plat[:3]}: {p_on}/{p_t}</span>'
+
+        rl = kb["risk_level"]
+        fl = kb["friction_level"]
+        risk_badge_color = {"critical":"#7d1128","high":"#dc3545","medium":"#fd7e14","low":"#28a745"}
+        friction_badge_color = {"high":"#dc3545","medium":"#fd7e14","low":"#28a745"}
+        rows.append({
+            "sort_key": risk_order.get(rl, 99),
+            "html": (
+                f'<tr>'
+                f'<td><span class="badge" style="background:{risk_badge_color.get(rl,"#6c757d")}">{rl.upper()}</span></td>'
+                f'<td><strong>{kb["name"]}</strong><br><small class="text-muted">{kb["desc"]}</small></td>'
+                f'<td>{status_html}<br>{plat_badges}</td>'
+                f'<td style="font-size:.78rem">{kb["risk_off"]}</td>'
+                f'<td><span class="badge" style="background:{friction_badge_color.get(fl,"#6c757d")}">{fl.upper()}</span><br>'
+                f'<small class="text-muted">{kb["friction_on"]}</small></td>'
+                f'</tr>')
+        })
+
+    # Settings OFF without KB (generic row)
+    unknown_off = []
+    for sname, info in settings_seen.items():
+        if info["kb"]:
+            continue
+        all_vals = []
+        for plat_pols in info["platforms"].values():
+            all_vals.extend(plat_pols.values())
+        if any(v.upper()=="OFF" for v in all_vals):
+            unknown_off.append(sname)
+    if unknown_off:
+        rows.append({
+            "sort_key": 5,
+            "html": (
+                f'<tr class="table-light">'
+                f'<td><span class="badge bg-secondary">INFO</span></td>'
+                f'<td><strong>{len(unknown_off)} settings adicionales con valor OFF</strong><br>'
+                f'<small class="text-muted">{", ".join(unknown_off[:8])}{"..." if len(unknown_off)>8 else ""}</small></td>'
+                f'<td colspan="3" style="font-size:.78rem">Estos settings no tienen evaluación de riesgo predefinida. '
+                f'Revisar la documentación de CrowdStrike para cada uno.</td></tr>')
+        })
+
+    rows.sort(key=lambda x: x["sort_key"])
+
+    return f"""
+    <div class="card">
+      <div class="card-body p-0">
+        <div class="table-responsive" style="max-height:600px;overflow-y:auto">
+          <table class="table table-sm table-hover mb-0" style="font-size:.82rem">
+            <thead class="table-dark sticky-top">
+              <tr>
+                <th style="width:80px">Riesgo<br><small style="font-weight:400">(si OFF)</small></th>
+                <th style="width:25%">Setting</th>
+                <th style="width:12%">Estado actual</th>
+                <th style="width:30%">Impacto de tenerlo desactivado</th>
+                <th style="width:20%">Friccion<br><small style="font-weight:400">(si se activa)</small></th>
+              </tr>
+            </thead>
+            <tbody>{"".join(r["html"] for r in rows)}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>"""
+
+
+# ---------------------------
 # HTML Report
 # ---------------------------
 def _safe_json(obj) -> str:
@@ -615,6 +1198,18 @@ def generate_html_report(
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     title       = f"CrowdStrike Falcon Health Check — {client_name or cid}"
 
+    # ---- Health Score ----
+    health = compute_health_score(df_hosts, df_prev, df_dets, df_sensor_age_counts, ngsiem)
+    health_score = health["overall"]
+    health_breakdown = health["breakdown"]
+    score_color = "#28a745" if health_score >= 75 else "#ffc107" if health_score >= 50 else "#fd7e14" if health_score >= 30 else "#dc3545"
+
+    # ---- Recommendations ----
+    recs = generate_recommendations(df_hosts, df_prev, df_dets, df_sensor_age_counts, ngsiem)
+    recs_html = _recommendations_html(recs)
+    recs_critical = sum(1 for r in recs if r["severity"]=="critical")
+    recs_high = sum(1 for r in recs if r["severity"]=="high")
+
     # ---- KPIs ----
     s = df_summary.iloc[0] if not df_summary.empty else {}
     total_sensors   = int(s.get("Total Sensors", 0))
@@ -622,13 +1217,41 @@ def generate_html_report(
     mac_sensors     = int(s.get("Mac Sensors", 0))
     lin_sensors     = int(s.get("Linux Sensors", 0))
     inactive_14d    = int(s.get("Inactive (>14d)", 0))
-    rfm_count       = int(df_hosts["rfm_state"].notna().sum()) if not df_hosts.empty else 0
+    rfm_count       = int(df_hosts["rfm_state"].apply(lambda x: str(x).lower() in ("true","yes","1") if pd.notna(x) else False).sum()) if not df_hosts.empty else 0
 
     if not df_detects_summary.empty:
         detects_90d = int(df_detects_summary.iloc[0].get("detects_90d", 0))
         pct_new_90d = float(df_detects_summary.iloc[0].get("pct_new_90d", 0))
     else:
         detects_90d, pct_new_90d = 0, 0.0
+
+    # ---- Policy Compliance ----
+    def _policy_compliance(df, plat):
+        d = df[df["platform_name"].str.upper()==plat.upper()]
+        if d.empty or "value_norm" not in d:
+            return 0, 0, 0
+        on = int((d["value_norm"].str.upper()=="ON").sum())
+        total = len(d[d["value_norm"].notna()])
+        return on, total, round(on/total*100) if total else 0
+    win_on, win_total, win_pct = _policy_compliance(df_prev, "Windows")
+    mac_on, mac_total, mac_pct = _policy_compliance(df_prev, "Mac")
+    lin_on, lin_total, lin_pct = _policy_compliance(df_prev, "Linux")
+
+    # ---- Sensor freshness % ----
+    sensor_fresh_pct = 0
+    if not df_sensor_age_counts.empty and total_sensors > 0:
+        comb = df_sensor_age_counts[df_sensor_age_counts["platform"]=="Combined"]
+        if not comb.empty:
+            fresh = int(comb.iloc[0].get("N",0)) + int(comb.iloc[0].get("N-1",0))
+            sensor_fresh_pct = round(fresh / total_sensors * 100)
+
+    # ---- Detection response metrics ----
+    dets_open = dets_closed = dets_new_crit = 0
+    if not df_dets.empty and "status" in df_dets:
+        unique_dets = df_dets.drop_duplicates("detection_id")
+        dets_open = int(unique_dets["status"].str.lower().isin(["new","in_progress","reopened"]).sum())
+        dets_closed = int(unique_dets["status"].str.lower().isin(["closed","resolved","true_positive","false_positive"]).sum())
+        dets_new_crit = int(unique_dets[(unique_dets["status"].str.lower()=="new") & (unique_dets["severity"].str.upper().isin(["CRITICAL","HIGH"]))].shape[0])
 
     # ---- Sensor Age chart data ----
     age_platforms = ["Windows", "Mac", "Linux", "Combined"]
@@ -862,51 +1485,162 @@ def generate_html_report(
     body {{ background:#f5f5f7; font-family:'Segoe UI',system-ui,sans-serif; color:#1c1c1e; }}
     .navbar {{ background:var(--cs-dark) !important; border-bottom:3px solid var(--cs-red); }}
     .navbar-brand {{ color:#fff !important; font-weight:700; font-size:1.1rem; letter-spacing:.3px; }}
-    .nav-link {{ color:rgba(255,255,255,.75) !important; font-size:.85rem; }}
-    .nav-link:hover {{ color:#fff !important; }}
+    /* — Navbar links — */
+    .navbar .nav-link {{ color:rgba(255,255,255,.75) !important; font-size:.85rem;
+                         transition:color .15s; }}
+    .navbar .nav-link:hover {{ color:#fff !important; }}
+
+    /* — Policy tabs (Windows / Mac / Linux) — */
+    .nav-tabs {{
+      background: linear-gradient(to bottom, #f5f5f7, #eaeaed);
+      border-bottom: 2px solid #d0d0d5;
+      padding: .4rem 0 0 .5rem;
+    }}
+    .nav-tabs .nav-link {{
+      color: #495057 !important;
+      font-size: .85rem;
+      font-weight: 500;
+      border: none !important;
+      border-radius: 8px 8px 0 0 !important;
+      padding: .55rem 1.3rem;
+      margin-bottom: -2px;
+      transition: all .15s;
+    }}
+    .nav-tabs .nav-link:hover {{
+      color: var(--cs-red) !important;
+      background: rgba(225,0,26,.06);
+    }}
+    .nav-tabs .nav-link.active {{
+      color: var(--cs-red) !important;
+      font-weight: 700;
+      background: #fff !important;
+      border: 2px solid #d0d0d5 !important;
+      border-bottom-color: #fff !important;
+      box-shadow: 0 -2px 6px rgba(0,0,0,.04);
+    }}
+
+    /* — Tab content area — */
+    .tab-content {{
+      background: #fff;
+      border-left: 1px solid #d0d0d5;
+      border-right: 1px solid #d0d0d5;
+      border-bottom: 1px solid #d0d0d5;
+      border-radius: 0 0 10px 10px;
+      padding: 1rem;
+    }}
+
+    /* — Section titles — */
     .section-title {{
       font-size:1.05rem; font-weight:700; text-transform:uppercase;
       letter-spacing:.5px; color:var(--cs-red); border-left:4px solid var(--cs-red);
       padding-left:.6rem; margin-bottom:1rem;
     }}
+
+    /* — KPI cards — */
     .kpi-card {{ border:none; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,.08); }}
     .kpi-card .card-body {{ padding:1rem 1.2rem; }}
     .kpi-number {{ font-size:2rem; font-weight:700; line-height:1; }}
-    .kpi-label {{ font-size:.78rem; text-transform:uppercase; letter-spacing:.4px; color:#6c757d; margin-top:.2rem; }}
-    .card {{ border:none; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,.07); }}
-    .card-header {{ background:transparent; border-bottom:1px solid #e9ecef;
+    .kpi-label {{ font-size:.78rem; text-transform:uppercase; letter-spacing:.4px;
+                  color:#6c757d; margin-top:.2rem; }}
+
+    /* — Cards — */
+    .card {{ border:none; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,.07); background:#fff; }}
+    .card-header {{ background:#fafafa; border-bottom:1px solid #e9ecef;
                     font-weight:600; font-size:.9rem; padding:.75rem 1rem; }}
+
+    /* — Policy matrix — */
     .policy-table-wrap {{ max-height:480px; overflow-y:auto; }}
     .policy-matrix td, .policy-matrix th {{ font-size:.78rem; padding:.3rem .5rem; white-space:nowrap; }}
     .setting-name {{ min-width:200px; max-width:280px; white-space:normal; font-size:.79rem; }}
     .policy-col {{ min-width:120px; text-align:center; font-size:.79rem; }}
     .sticky-header th {{ position:sticky; top:0; z-index:2; }}
+
+    /* — Sortable tables — */
     table.filterable-table th {{ cursor:pointer; user-select:none; }}
     table.filterable-table th:hover {{ background:#f0f0f0; }}
     .search-box {{ max-width:320px; }}
     .badge {{ font-size:.72rem; font-weight:600; }}
+
+    /* — Severity colors — */
     .sev-CRITICAL {{ color:#7d1128; font-weight:700; }}
     .sev-HIGH     {{ color:#dc3545; font-weight:700; }}
     .sev-MEDIUM   {{ color:#fd7e14; font-weight:600; }}
     .sev-LOW      {{ color:#856404; }}
     .sev-INFORMATIONAL {{ color:#6c757d; }}
+
+    /* — Status colors — */
     .status-NEW       {{ color:#dc3545; font-weight:700; }}
     .status-IN_PROGRESS {{ color:#fd7e14; font-weight:600; }}
     .status-CLOSED    {{ color:#28a745; }}
     .rfm-yes {{ color:#dc3545; font-weight:700; }}
     .inactive-yes {{ color:#dc3545; }}
-    footer {{ background:var(--cs-dark); color:rgba(255,255,255,.5); font-size:.78rem; padding:1rem 2rem; margin-top:3rem; }}
+
+    /* — Scrollbar — */
+    .policy-table-wrap::-webkit-scrollbar {{ width:6px; }}
+    .policy-table-wrap::-webkit-scrollbar-thumb {{ background:#ccc; border-radius:3px; }}
+
+    /* — Health Score Donut — */
+    .score-ring {{ position:relative; width:140px; height:140px; }}
+    .score-ring canvas {{ width:140px !important; height:140px !important; }}
+    .score-ring-label {{ position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); text-align:center; }}
+    .score-ring-number {{ font-size:2.4rem; font-weight:800; line-height:1; }}
+    .score-ring-text {{ font-size:.65rem; text-transform:uppercase; letter-spacing:.5px; color:#6c757d; }}
+
+    /* — Compliance bars — */
+    .compliance-bar {{ height:8px; border-radius:4px; background:#e9ecef; overflow:hidden; }}
+    .compliance-fill {{ height:100%; border-radius:4px; transition:width .6s; }}
+
+    /* — Cover page — */
+    .cover-page {{
+      background: linear-gradient(135deg, #1c1c1e 0%, #2c2c2e 40%, #E1001A 100%);
+      color:#fff; padding:4rem 3rem 3rem; position:relative; overflow:hidden;
+    }}
+    .cover-page::before {{
+      content:''; position:absolute; top:-50%; right:-20%;
+      width:500px; height:500px; border-radius:50%;
+      background:rgba(225,0,26,.15); filter:blur(80px);
+    }}
+
+    .chart-container {{ position:relative; height:260px; }}
+    .chart-container-lg {{ position:relative; height:340px; }}
+
+    footer {{ background:var(--cs-dark); color:rgba(255,255,255,.5);
+              font-size:.78rem; padding:1rem 2rem; margin-top:3rem; }}
+
     @media print {{
       .no-print {{ display:none !important; }}
       .card {{ break-inside:avoid; }}
       .policy-table-wrap {{ max-height:none !important; overflow:visible !important; }}
+      .cover-page {{ break-after:page; }}
+      body {{ background:#fff; }}
     }}
-    .chart-container {{ position:relative; height:260px; }}
-    .chart-container-lg {{ position:relative; height:340px; }}
-    .chart-container-trend {{ position:relative; height:200px; }}
   </style>
 </head>
 <body>
+
+<!-- COVER PAGE -->
+<div class="cover-page no-print">
+  <div style="position:relative;z-index:1">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:2rem">
+      <svg width="36" height="24" viewBox="0 0 120 80" fill="#E1001A">
+        <ellipse cx="60" cy="40" rx="58" ry="30"/><ellipse cx="60" cy="40" rx="42" ry="20" fill="#1c1c1e"/>
+        <ellipse cx="60" cy="40" rx="26" ry="12"/>
+      </svg>
+      <span style="font-size:.9rem;font-weight:300;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.5)">CrowdStrike Falcon</span>
+    </div>
+    <div style="font-size:2.6rem;font-weight:800;line-height:1.1;margin-bottom:.4rem">Health Check Report</div>
+    <div style="font-size:1.2rem;font-weight:300;color:rgba(255,255,255,.65);margin-bottom:2rem">{client_name or cid}</div>
+    <div style="display:flex;gap:3rem;flex-wrap:wrap;margin-bottom:2rem">
+      <div><div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:rgba(255,255,255,.35);margin-bottom:.2rem">Fecha</div><div>{report_date}</div></div>
+      <div><div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:rgba(255,255,255,.35);margin-bottom:.2rem">Sensores</div><div>{total_sensors:,}</div></div>
+      <div><div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:rgba(255,255,255,.35);margin-bottom:.2rem">Detecciones 90d</div><div>{detects_90d:,}</div></div>
+      <div><div style="font-size:.65rem;text-transform:uppercase;letter-spacing:1px;color:rgba(255,255,255,.35);margin-bottom:.2rem">Health Score</div><div style="font-size:1.8rem;font-weight:800;color:{score_color}">{health_score}/100</div></div>
+    </div>
+    <div style="font-size:.7rem;color:rgba(255,255,255,.25);border-top:1px solid rgba(255,255,255,.1);padding-top:.8rem">
+      CONFIDENCIAL — Este documento contiene informacion privilegiada del tenant de seguridad.
+    </div>
+  </div>
+</div>
 
 <!-- NAVBAR -->
 <nav class="navbar navbar-dark sticky-top no-print">
@@ -915,129 +1649,121 @@ def generate_html_report(
       <svg width="18" height="18" viewBox="0 0 24 24" fill="var(--cs-red)" style="margin-right:6px;vertical-align:-2px">
         <path d="M12 2L2 7v10l10 5 10-5V7L12 2z"/>
       </svg>
-      CrowdStrike Falcon · Health Check
+      CrowdStrike Health Check
     </span>
     <div class="d-flex gap-3 align-items-center">
       <a class="nav-link" href="#summary">Resumen</a>
       <a class="nav-link" href="#sensor-health">Sensores</a>
-      <a class="nav-link" href="#policies">Políticas</a>
+      <a class="nav-link" href="#policies">Politicas</a>
+      <a class="nav-link" href="#risk-matrix">Riesgo</a>
       <a class="nav-link" href="#ngsiem">NG SIEM</a>
       <a class="nav-link" href="#detections">Detecciones</a>
       <a class="nav-link" href="#hosts">Hosts</a>
-      <button class="btn btn-sm btn-outline-light ms-2" onclick="window.print()">⎙ Exportar PDF</button>
+      <button class="btn btn-sm btn-outline-light ms-2" onclick="window.print()">&#x23F6; PDF</button>
     </div>
   </div>
 </nav>
 
 <!-- HEADER -->
-<div style="background:var(--cs-dark);color:#fff;padding:1.5rem 2rem 1.2rem;">
-  <div class="d-flex justify-content-between align-items-end flex-wrap gap-2">
+<div style="background:var(--cs-dark);color:#fff;padding:1rem 2rem .8rem;">
+  <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
     <div>
-      <div style="font-size:1.4rem;font-weight:700">{client_name or 'Health Check Report'}</div>
-      <div style="color:rgba(255,255,255,.6);font-size:.85rem">CID: {cid} &nbsp;|&nbsp; Generado: {report_date}</div>
-    </div>
-    <div style="text-align:right;font-size:.78rem;color:rgba(255,255,255,.4)">
-      Customer Success · Falcon Health Check<br>
-      Datos: últimos 90 días (detecciones) / snapshot actual (hosts)
+      <div style="font-size:1.2rem;font-weight:700">{client_name or 'Health Check Report'}</div>
+      <div style="color:rgba(255,255,255,.4);font-size:.78rem">Generado: {report_date} | Datos: 90 dias (detecciones) / snapshot actual</div>
     </div>
   </div>
 </div>
 
 <div class="container-fluid px-4 py-4">
 
-<!-- ============================= SECTION 1: SUMMARY ============================= -->
+<!-- ============================= SECTION 1: EXECUTIVE SUMMARY ============================= -->
 <section id="summary" class="mb-5">
   <div class="section-title">Resumen Ejecutivo</div>
   <div class="row g-3 mb-4">
-    <div class="col-6 col-md-2">
-      <div class="card kpi-card h-100" style="border-top:4px solid var(--cs-red)">
-        <div class="card-body">
-          <div class="kpi-number">{total_sensors:,}</div>
-          <div class="kpi-label">Total Sensores</div>
+    <!-- Health Score Donut -->
+    <div class="col-6 col-md-3">
+      <div class="card h-100">
+        <div class="card-body d-flex flex-column align-items-center justify-content-center py-3">
+          <div class="score-ring"><canvas id="chartHealthScore"></canvas>
+            <div class="score-ring-label">
+              <div class="score-ring-number" style="color:{score_color}">{health_score}</div>
+              <div class="score-ring-text">Health Score</div>
+            </div>
+          </div>
+          <div class="mt-2 text-center" style="font-size:.72rem">
+            {f'<span class="badge" style="background:#7d1128">{recs_critical} Critical</span> ' if recs_critical else ''}
+            {f'<span class="badge bg-danger">{recs_high} High</span>' if recs_high else ''}
+            {f'<span class="badge bg-success">OK</span>' if not recs_critical and not recs_high else ''}
+          </div>
         </div>
       </div>
     </div>
-    <div class="col-6 col-md-2">
-      <div class="card kpi-card h-100" style="border-top:4px solid #0d6efd">
-        <div class="card-body">
-          <div class="kpi-number">{win_sensors:,}</div>
-          <div class="kpi-label">Windows</div>
+    <!-- Score Breakdown -->
+    <div class="col-6 col-md-3">
+      <div class="card h-100">
+        <div class="card-header" style="font-size:.82rem">Score por categoria</div>
+        <div class="card-body py-2" style="font-size:.78rem">
+          <div class="mb-2"><div class="d-flex justify-content-between"><span>Sensor Freshness</span><span class="fw-bold">{health_breakdown.get('sensor_freshness',0):.0f}%</span></div>
+            <div class="compliance-bar"><div class="compliance-fill" style="width:{health_breakdown.get('sensor_freshness',0)}%;background:{'#28a745' if health_breakdown.get('sensor_freshness',0)>=70 else '#ffc107' if health_breakdown.get('sensor_freshness',0)>=40 else '#dc3545'}"></div></div></div>
+          <div class="mb-2"><div class="d-flex justify-content-between"><span>Sensor Activity</span><span class="fw-bold">{health_breakdown.get('sensor_activity',0):.0f}%</span></div>
+            <div class="compliance-bar"><div class="compliance-fill" style="width:{health_breakdown.get('sensor_activity',0)}%;background:{'#28a745' if health_breakdown.get('sensor_activity',0)>=70 else '#ffc107' if health_breakdown.get('sensor_activity',0)>=40 else '#dc3545'}"></div></div></div>
+          <div class="mb-2"><div class="d-flex justify-content-between"><span>RFM Free</span><span class="fw-bold">{health_breakdown.get('rfm',0):.0f}%</span></div>
+            <div class="compliance-bar"><div class="compliance-fill" style="width:{health_breakdown.get('rfm',0)}%;background:{'#28a745' if health_breakdown.get('rfm',0)>=90 else '#ffc107' if health_breakdown.get('rfm',0)>=70 else '#dc3545'}"></div></div></div>
+          <div class="mb-2"><div class="d-flex justify-content-between"><span>Policy Compliance</span><span class="fw-bold">{health_breakdown.get('policy_compliance',0):.0f}%</span></div>
+            <div class="compliance-bar"><div class="compliance-fill" style="width:{health_breakdown.get('policy_compliance',0)}%;background:{'#28a745' if health_breakdown.get('policy_compliance',0)>=70 else '#ffc107' if health_breakdown.get('policy_compliance',0)>=40 else '#dc3545'}"></div></div></div>
+          <div class="mb-2"><div class="d-flex justify-content-between"><span>Detection Resolution</span><span class="fw-bold">{health_breakdown.get('detection_resolution',0):.0f}%</span></div>
+            <div class="compliance-bar"><div class="compliance-fill" style="width:{health_breakdown.get('detection_resolution',0)}%;background:{'#28a745' if health_breakdown.get('detection_resolution',0)>=70 else '#ffc107' if health_breakdown.get('detection_resolution',0)>=40 else '#dc3545'}"></div></div></div>
+          <div class="mb-1"><div class="d-flex justify-content-between"><span>NG SIEM Usage</span><span class="fw-bold">{health_breakdown.get('ngsiem',0):.0f}%</span></div>
+            <div class="compliance-bar"><div class="compliance-fill" style="width:{health_breakdown.get('ngsiem',0)}%;background:{'#28a745' if health_breakdown.get('ngsiem',0)>=70 else '#ffc107' if health_breakdown.get('ngsiem',0)>=40 else '#dc3545'}"></div></div></div>
         </div>
       </div>
     </div>
-    <div class="col-6 col-md-2">
-      <div class="card kpi-card h-100" style="border-top:4px solid #6c757d">
-        <div class="card-body">
-          <div class="kpi-number">{mac_sensors:,}</div>
-          <div class="kpi-label">Mac</div>
-        </div>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card kpi-card h-100" style="border-top:4px solid #fd7e14">
-        <div class="card-body">
-          <div class="kpi-number">{lin_sensors:,}</div>
-          <div class="kpi-label">Linux</div>
-        </div>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card kpi-card h-100" style="border-top:4px solid {'#dc3545' if inactive_pct>5 else '#ffc107' if inactive_pct>2 else '#28a745'}">
-        <div class="card-body">
-          <div class="kpi-number">{inactive_14d:,}</div>
-          <div class="kpi-label">Inactivos &gt;14d <small>({inactive_pct}%)</small></div>
-        </div>
-      </div>
-    </div>
-    </div><!-- /kpi row close early to allow NG SIEM ingest bar below -->
-    <!-- Ingest bar (full width, only if NG SIEM data available) -->
-    {'<div class="row g-3 mb-3"><div class="col-12"><div class="card" style="border-left:4px solid var(--cs-red)"><div class="card-body py-2"><div class="d-flex justify-content-between align-items-center flex-wrap gap-2"><div><strong>NG SIEM Ingesta diaria</strong> &nbsp;<span class="text-muted" style="font-size:.85rem">Promedio 30d: <strong>' + str(ng_avg_gb_day) + ' GB</strong> / <strong>' + str(ng_limit_gb) + ' GB</strong> límite &nbsp;|&nbsp; Hoy: <strong>' + str(ng_today_mb) + ' MB</strong></span></div><div style="font-size:.82rem;color:#6c757d">' + str(ng_pct_used) + '% del límite utilizado</div></div><div class="progress mt-2" style="height:8px"><div class="progress-bar" style="width:' + str(min(ng_pct_used,100)) + '%;background:var(--cs-red)"></div></div></div></div></div></div>' if ng_avg_gb_day else ''}
-    <!-- remaining KPI cards as a separate row -->
-    <div class="row g-3 mb-4">
-    <div class="col-6 col-md-2">
-      <div class="card kpi-card h-100" style="border-top:4px solid {'#dc3545' if pct_new_90d>30 else '#ffc107' if pct_new_90d>10 else '#28a745'}">
-        <div class="card-body">
-          <div class="kpi-number">{detects_90d:,}</div>
-          <div class="kpi-label">Detecciones 90d <small>({pct_new_90d:.1f}% NEW)</small></div>
-        </div>
+    <!-- KPI grid -->
+    <div class="col-12 col-md-6">
+      <div class="row g-3">
+        <div class="col-4"><div class="card kpi-card h-100" style="border-top:4px solid var(--cs-red)"><div class="card-body"><div class="kpi-number">{total_sensors:,}</div><div class="kpi-label">Sensores</div></div></div></div>
+        <div class="col-4"><div class="card kpi-card h-100" style="border-top:4px solid {'#dc3545' if inactive_14d > total_sensors*0.1 else '#ffc107' if inactive_14d > 0 else '#28a745'}"><div class="card-body"><div class="kpi-number" style="color:{'#dc3545' if inactive_14d > total_sensors*0.1 else '#6c757d'}">{inactive_14d}</div><div class="kpi-label">Inactivos 14d+</div></div></div></div>
+        <div class="col-4"><div class="card kpi-card h-100" style="border-top:4px solid {'#dc3545' if rfm_count>0 else '#28a745'}"><div class="card-body"><div class="kpi-number" style="color:{'#dc3545' if rfm_count>0 else '#28a745'}">{rfm_count}</div><div class="kpi-label">RFM</div></div></div></div>
+        <div class="col-4"><div class="card kpi-card h-100" style="border-top:4px solid #fd7e14"><div class="card-body"><div class="kpi-number">{detects_90d:,}</div><div class="kpi-label">Detecciones 90d</div></div></div></div>
+        <div class="col-4"><div class="card kpi-card h-100" style="border-top:4px solid {'#dc3545' if dets_new_crit>0 else '#28a745'}"><div class="card-body"><div class="kpi-number" style="color:{'#dc3545' if dets_new_crit>0 else '#28a745'}">{dets_new_crit}</div><div class="kpi-label">Crit/High Open</div></div></div></div>
+        <div class="col-4"><div class="card kpi-card h-100" style="border-top:4px solid #28a745"><div class="card-body"><div class="kpi-number">{sensor_fresh_pct}%</div><div class="kpi-label">Sensor Fresh</div></div></div></div>
       </div>
     </div>
   </div>
 
-  <!-- Platform distribution + detection status mini charts -->
+  <!-- NG SIEM ingest bar -->
+  {'<div class="row g-3 mb-3"><div class="col-12"><div class="card" style="border-left:4px solid var(--cs-red)"><div class="card-body py-2"><div class="d-flex justify-content-between align-items-center flex-wrap gap-2"><div><strong>NG SIEM Ingesta</strong> <span class="text-muted" style="font-size:.85rem">Prom: <strong>' + str(ng_avg_gb_day) + ' GB</strong> / <strong>' + str(ng_limit_gb) + ' GB</strong> limite | Hoy: <strong>' + str(ng_today_mb) + ' MB</strong></span></div><div style="font-size:.82rem;color:#6c757d">' + str(ng_pct_used) + '%</div></div><div class="progress mt-2" style="height:8px"><div class="progress-bar" style="width:' + str(min(ng_pct_used,100)) + '%;background:var(--cs-red)"></div></div></div></div></div></div>' if ng_avg_gb_day else ''}
+
+  <!-- Charts row -->
   <div class="row g-3">
     <div class="col-md-3">
-      <div class="card h-100">
-        <div class="card-header">Distribución de plataformas</div>
+      <div class="card h-100"><div class="card-header">Plataformas</div>
         <div class="card-body d-flex align-items-center justify-content-center">
-          <div class="chart-container" style="height:200px;width:200px">
-            <canvas id="chartPlatform"></canvas>
-          </div>
-        </div>
-      </div>
+          <div style="height:200px;width:200px;position:relative"><canvas id="chartPlatform"></canvas></div></div></div>
     </div>
-    <div class="col-md-4">
-      <div class="card h-100">
-        <div class="card-header">Estado de detecciones (90d)</div>
-        <div class="card-body">
-          <div class="chart-container" style="height:200px">
-            <canvas id="chartDetStatus"></canvas>
-          </div>
-        </div>
-      </div>
+    <div class="col-md-3">
+      <div class="card h-100"><div class="card-header">Severidad detecciones</div>
+        <div class="card-body d-flex align-items-center justify-content-center">
+          <div style="height:200px;width:200px;position:relative"><canvas id="chartDetSev"></canvas></div></div></div>
     </div>
-    <div class="col-md-5">
-      <div class="card h-100">
-        <div class="card-header">Severidad de detecciones (90d)</div>
-        <div class="card-body">
-          <div class="chart-container" style="height:200px">
-            <canvas id="chartDetSev"></canvas>
-          </div>
-        </div>
-      </div>
+    <div class="col-md-3">
+      <div class="card h-100"><div class="card-header">Estado detecciones</div>
+        <div class="card-body"><div style="height:200px"><canvas id="chartDetStatus"></canvas></div></div></div>
+    </div>
+    <div class="col-md-3">
+      <div class="card h-100"><div class="card-header">Policy Compliance</div>
+        <div class="card-body py-2" style="font-size:.82rem">
+          <div class="mb-3"><div class="d-flex justify-content-between"><span>Windows ({win_on}/{win_total})</span><strong>{win_pct}%</strong></div>
+            <div class="compliance-bar mt-1"><div class="compliance-fill" style="width:{win_pct}%;background:{'#28a745' if win_pct>=70 else '#ffc107' if win_pct>=40 else '#dc3545'}"></div></div></div>
+          <div class="mb-3"><div class="d-flex justify-content-between"><span>Mac ({mac_on}/{mac_total})</span><strong>{mac_pct}%</strong></div>
+            <div class="compliance-bar mt-1"><div class="compliance-fill" style="width:{mac_pct}%;background:{'#28a745' if mac_pct>=70 else '#ffc107' if mac_pct>=40 else '#dc3545'}"></div></div></div>
+          <div><div class="d-flex justify-content-between"><span>Linux ({lin_on}/{lin_total})</span><strong>{lin_pct}%</strong></div>
+            <div class="compliance-bar mt-1"><div class="compliance-fill" style="width:{lin_pct}%;background:{'#28a745' if lin_pct>=70 else '#ffc107' if lin_pct>=40 else '#dc3545'}"></div></div></div>
+        </div></div>
     </div>
   </div>
 </section>
+
 
 <!-- ============================= SECTION 2: SENSOR HEALTH ============================= -->
 <section id="sensor-health" class="mb-5">
@@ -1113,18 +1839,29 @@ def generate_html_report(
   </ul>
   <div class="tab-content">
     <div class="tab-pane fade show active" id="polWin">
-      <div class="card"><div class="card-header">Prevention Policy Settings — Windows</div>
-      <div class="card-body p-2">{win_pol_html}</div></div>
+      <div class="fw-semibold mb-2" style="font-size:.9rem">Prevention Policy Settings — Windows</div>
+      <div class="policy-table-wrap">{win_pol_html}</div>
     </div>
     <div class="tab-pane fade" id="polMac">
-      <div class="card"><div class="card-header">Prevention Policy Settings — Mac</div>
-      <div class="card-body p-2">{mac_pol_html}</div></div>
+      <div class="fw-semibold mb-2" style="font-size:.9rem">Prevention Policy Settings — Mac</div>
+      <div class="policy-table-wrap">{mac_pol_html}</div>
     </div>
     <div class="tab-pane fade" id="polLin">
-      <div class="card"><div class="card-header">Prevention Policy Settings — Linux</div>
-      <div class="card-body p-2">{lin_pol_html}</div></div>
+      <div class="fw-semibold mb-2" style="font-size:.9rem">Prevention Policy Settings — Linux</div>
+      <div class="policy-table-wrap">{lin_pol_html}</div>
     </div>
   </div>
+</section>
+
+<!-- ============================= SECTION 3a: RISK vs FRICTION ============================= -->
+<section id="risk-matrix" class="mb-5">
+  <div class="section-title">Matriz de Riesgo vs Friccion — Prevention Settings</div>
+  <div class="alert alert-light py-2 mb-3" style="font-size:.82rem;border-left:4px solid var(--cs-red)">
+    <strong>Riesgo:</strong> impacto de tener el setting desactivado (OFF). &nbsp;
+    <strong>Friccion:</strong> impacto operativo de activarlo (ON) — posibles falsos positivos o afectacion a usuarios.
+    <br><small class="text-muted">Recomendacion: activar primero los settings de riesgo CRITICAL + friccion LOW. Para friccion HIGH, empezar en modo DETECT antes de pasar a PREVENT.</small>
+  </div>
+  {_build_risk_matrix_html(df_prev)}
 </section>
 
 <!-- ============================= SECTION 3b: NG SIEM ============================= -->
@@ -1402,6 +2139,21 @@ const D = {{
 // ============================================================
 Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
 Chart.defaults.plugins.legend.labels.boxWidth = 12;
+
+// Health Score donut
+new Chart(document.getElementById('chartHealthScore'), {{
+  type:'doughnut',
+  data:{{
+    datasets:[{{
+      data:[{health_score}, {100-health_score}],
+      backgroundColor:['{score_color}', '#e9ecef'],
+      borderWidth:0, cutout:'78%'
+    }}]
+  }},
+  options:{{ responsive:false, maintainAspectRatio:false,
+             plugins:{{ legend:{{ display:false }}, tooltip:{{ enabled:false }} }},
+             animation:{{ animateRotate:true, duration:1200 }} }}
+}});
 
 // Platform donut
 new Chart(document.getElementById('chartPlatform'), {{
@@ -1901,6 +2653,13 @@ def main():
         df_dets_xls.to_excel(w,        index=False, sheet_name="Detections_Detailed")
         pivot_tactic.to_excel(w,       index=False, sheet_name="Detections_By_Tactic")
         pivot_host.to_excel(w,         index=False, sheet_name="Detections_By_Host")
+        # Health Score
+        health_export = compute_health_score(df_hosts, df_prev, df_dets, df_sensor_age_counts, ng)
+        pd.DataFrame([{
+            "overall_score": health_export["overall"],
+            **{f"score_{k}": v for k,v in health_export["breakdown"].items()},
+            **{f"weight_{k}": v for k,v in health_export["weights"].items()},
+        }]).to_excel(w, index=False, sheet_name="Health_Score")
         # NG SIEM sheets
         if ng["available"]:
             pd.DataFrame(ng["repos"]).to_excel(w, index=False, sheet_name="NGSIEM_Repos")

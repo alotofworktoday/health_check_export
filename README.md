@@ -4,22 +4,45 @@ Generates an interactive HTML + Excel report with the health status of a CrowdSt
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![FalconPy](https://img.shields.io/badge/CrowdStrike-FalconPy-red)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+## Features
+
+- **Health Score (0-100)** — Weighted score across 6 categories with animated donut chart
+- **Professional cover page** — Gradient design with client name, date, KPIs, and confidentiality notice
+- **Risk vs Friction matrix** — Maps each prevention setting to its security risk (if OFF) and operational friction (if ON), helping clients prioritize what to enable
+- **Policy compliance bars** — Visual % of prevention settings enabled per platform (Windows/Mac/Linux)
+- **MITRE ATT&CK mapping** — Detections broken down by tactic
+- **NG SIEM visibility** — Data connectors status, ingest volume vs. limit
+- **Print-optimized** — One-click PDF export with proper page breaks
 
 ## Report Sections
 
 | Section | Description |
 |---------|-------------|
-| **Executive Summary** | KPIs: total sensors, active sensors, sensor version, OS coverage |
-| **Sensor Health** | Version distribution, outdated sensors, platforms (Win/Mac/Linux) |
+| **Executive Summary** | Health Score donut, score breakdown by category, KPI cards (sensors, RFM, inactive, critical detections), platform distribution, severity/status charts, policy compliance bars |
+| **Sensor Health** | Sensor age by platform (N/N-1/N-2/N-3+), version distribution, OS versions, sensor update policies |
 | **Prevention Policies** | ON/OFF matrix per setting per policy (Windows / Mac / Linux tabs) |
-| **NG SIEM** | Data connectors, connection status, daily ingest volume vs. limit |
-| **Detections / Alerts** | Severity breakdown, top affected hosts, timeline trend, per-detection detail |
-| **Hosts** | Full inventory with OS, sensor version, last seen, assigned policies |
+| **Risk vs Friction** | Each prevention setting mapped to: risk if disabled, operational friction if enabled, current state across policies |
+| **NG SIEM** | Data connectors, connection status, daily ingest volume, inferred sources from XDR alerts |
+| **Detections / Alerts** | Severity breakdown, MITRE tactics, top 10 affected hosts, daily trend, full detail table with search |
+| **Hosts** | Full inventory with OS, sensor version, last seen, assigned policies, searchable |
+
+## Health Score Breakdown
+
+| Category (weight) | What it measures |
+|--------------------|-----------------|
+| Sensor Freshness (25%) | % of sensors on version N or N-1 |
+| Policy Compliance (25%) | % of prevention settings set to ON |
+| Sensor Activity (15%) | % of sensors active in last 14 days |
+| Detection Resolution (15%) | % of detections in closed/resolved state |
+| RFM Free (10%) | % of sensors NOT in Reduced Functionality Mode |
+| NG SIEM Usage (10%) | NG SIEM active + connector health |
 
 ## Output
 
-- `health_check.html` — self-contained report (Bootstrap 5 + Chart.js via CDN), shareable by email or opened in any browser
-- `health_check.xlsx` — multi-sheet Excel for detailed analysis
+- `health_check.html` — Self-contained report (Bootstrap 5 + Chart.js via CDN), shareable as a single file
+- `health_check.xlsx` — Multi-sheet Excel with raw data + Health Score sheet
 
 ## Requirements
 
@@ -83,7 +106,8 @@ The script will:
 2. Pull sensors, policies, and detections
 3. Try the Alerts v2 API; fall back to Detections if unavailable
 4. Infer NG SIEM connectors from XDR alerts + manual `.env` overrides
-5. Generate `health_check.html` and `health_check.xlsx`
+5. Compute health score and risk matrix
+6. Generate `health_check.html` and `health_check.xlsx`
 
 ## MSSP / Multi-tenant
 
@@ -109,6 +133,7 @@ crwd-falconpy/
 - The HTML report is **self-contained**: CSS (Bootstrap 5.3) and JS (Chart.js 4) are loaded via CDN. It can be shared as a single file.
 - NG SIEM data is populated manually via `.env` until CrowdStrike enables direct API access for client credentials.
 - The script auto-detects whether the tenant uses the legacy Detections API or the newer Alerts v2 API.
+- The Risk vs Friction matrix includes 18+ prevention settings with curated descriptions based on CrowdStrike best practices.
 
 ## License
 
